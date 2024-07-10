@@ -1,14 +1,15 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use anyhow::Context;
 use clap::{Args, Subcommand};
 use docker_credential::DockerCredential;
 use oci_distribution::{
     client::{ClientConfig, ClientProtocol},
+    manifest::OciImageManifest,
     secrets::RegistryAuth,
     Reference,
 };
-use oci_wasm::{WasmClient, WasmConfig};
+use oci_wasm::{ToConfig, WasmClient, WasmConfig};
 
 #[derive(Debug, Args)]
 pub struct Auth {
@@ -22,12 +23,7 @@ pub struct Auth {
     )]
     pub username: Option<String>,
     /// The password to use for authentication. This is required if username is set
-    #[clap(
-        id = "password",
-        short = 'p',
-        env = "WKG_OCI_PASSWORD",
-        requires = "username"
-    )]
+    #[clap(id = "password", short = 'p', env = "WKG_OCI_PASSWORD")]
     pub password: Option<String>,
 }
 
@@ -84,6 +80,8 @@ pub enum OciCommands {
     Pull(PullArgs),
     /// Push a component to an OCI registry.
     Push(PushArgs),
+    /// Dump an OCI artifact to disk
+    Output(OutputArgs),
 }
 
 impl OciCommands {
@@ -91,6 +89,7 @@ impl OciCommands {
         match self {
             OciCommands::Pull(args) => args.run().await,
             OciCommands::Push(args) => args.run().await,
+            OciCommands::Output(args) => args.run().await,
         }
     }
 }
@@ -123,6 +122,10 @@ pub struct PushArgs {
     #[clap(short = 'a', long = "author")]
     pub author: Option<String>,
 
+    /// An optional description to set for the pushed component
+    #[clap(long = "description")]
+    pub description: Option<String>,
+
     // TODO(thomastaylor312): Add support for custom annotations
     /// The OCI reference to push
     pub reference: Reference,
@@ -131,15 +134,59 @@ pub struct PushArgs {
     pub file: PathBuf,
 }
 
+#[derive(Debug, Args)]
+pub struct OutputArgs {
+    /// An optional author to set for the pushed component
+    #[clap(short = 'a', long = "author")]
+    pub author: Option<String>,
+
+    /// An optional description to set for the pushed component
+    #[clap(long = "description")]
+    pub description: Option<String>,
+
+    /// The path to the file to push
+    pub file: PathBuf,
+}
+
+impl OutputArgs {
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        let (config, component_layer) = WasmConfig::from_component(&self.file, self.author)
+            .await
+            .context("Unable to parse component")?;
+
+        let mut annotations = HashMap::new();
+        if let Some(description) = self.description.take() {
+            let key = "org.opencontainers.image.description".to_string();
+            annotations.insert(key, description);
+        }
+
+        const WASM_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
+        let layers = vec![component_layer];
+        let config = config.to_config()?;
+        let mut manifest = OciImageManifest::build(&layers, &config, Some(annotations));
+        manifest.media_type = Some(WASM_MANIFEST_MEDIA_TYPE.to_string());
+        dbg!(manifest);
+        Ok(())
+    }
+}
+
 impl PushArgs {
-    pub async fn run(self) -> anyhow::Result<()> {
+    pub async fn run(mut self) -> anyhow::Result<()> {
         let client = get_client(self.common);
         let (conf, layer) = WasmConfig::from_component(&self.file, self.author)
             .await
             .context("Unable to parse component")?;
+
+        let mut annotations = HashMap::new();
+        if let Some(description) = self.description.take() {
+            let key = "org.opencontainers.image.description".to_string();
+            annotations.insert(key, description);
+        }
+
         let auth = self.auth.into_auth(&self.reference)?;
         client
-            .push(&self.reference, &auth, layer, conf, None)
+            .push(&self.reference, &auth, layer, conf, Some(annotations))
             .await
             .context("Unable to push image")?;
         println!("Pushed {}", self.reference);
